@@ -2,6 +2,7 @@
 // Constantin Clerc (c22dev) - 0.1
 import AppKit
 import Combine
+import CoreImage
 import SwiftUI
 
 func nspKind(_ url: URL) -> String? {
@@ -255,6 +256,45 @@ func interfaces() -> [NetInterface] {
     return out
 }
 
+let padPort = 21421
+
+// The address phones type to reach the game: Wi-Fi or Ethernet, never a VPN or link-local one (.local names don't resolve on every phone)
+func joinURL(_ nets: [NetInterface]) -> String? {
+    let usable = nets.filter { n in !["utun", "bridge", "awdl", "llw", "anpi", "ap"].contains { n.name.hasPrefix($0) } && !n.ip.hasPrefix("169.254.") }
+    let pick = usable.first { $0.name == "en0" } ?? usable.first { $0.name.hasPrefix("en") } ?? usable.first
+    return pick.map { "http://\($0.ip):\(padPort)" }
+}
+
+func qrCode(_ text: String) -> CGImage? {
+    guard let f = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+    f.setValue(Data(text.utf8), forKey: "inputMessage")
+    f.setValue("M", forKey: "inputCorrectionLevel")
+    guard let out = f.outputImage?.transformed(by: CGAffineTransform(scaleX: 8, y: 8)) else { return nil }
+    return CIContext().createCGImage(out, from: out.extent)
+}
+
+// The application firewall drops phones' connections without telling anyone, so ask it up front
+func firewallProblem(for exe: URL) -> String? {
+    func ask(_ args: [String]) -> String {
+        let p = Process()
+        let pipe = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/libexec/ApplicationFirewall/socketfilterfw")
+        p.arguments = args
+        p.standardOutput = pipe
+        guard (try? p.run()) != nil else { return "" }
+        p.waitUntilExit()
+        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    }
+    guard ask(["--getglobalstate"]).contains("enabled") else { return nil }
+    if ask(["--getblockall"]).contains("enabled") {
+        return "The firewall blocks all incoming connections, so phones can't join. Turn that off in System Settings → Network → Firewall → Options"
+    }
+    if ask(["--getappblocked", exe.path]).contains("is blocked") {
+        return "The firewall blocks Mush8, so phones can't join. Allow it in System Settings → Network → Firewall → Options"
+    }
+    return nil
+}
+
 func availableMemory() -> UInt64 {
     #if os(iOS)
     return UInt64(os_proc_available_memory())
@@ -279,7 +319,15 @@ func bytes(_ n: UInt64) -> String { ByteCountFormatter.string(fromByteCount: Int
 final class SystemInfo: ObservableObject {
     @Published var available: UInt64 = availableMemory()
     @Published var nets: [NetInterface] = interfaces()
+    @Published var firewall: String?
     private var timer: Timer?
+
+    func checkFirewall(_ exe: URL) {
+        DispatchQueue.global(qos: .utility).async {
+            let problem = firewallProblem(for: exe)
+            DispatchQueue.main.async { self.firewall = problem }
+        }
+    }
 
     init() {
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -330,6 +378,8 @@ struct LauncherView: View {
                 if ready { dataSection(list) }
             }
             .formStyle(.grouped)
+            .onAppear { if s.phonePads { sys.checkFirewall(tool("nxhost", in: s.folderURL)) } }
+            .onChange(of: s.phonePads) { if s.phonePads { sys.checkFirewall(tool("nxhost", in: s.folderURL)) } }
             if let e = prep.error ?? launchError { Text(e).foregroundStyle(.red).font(.callout) }
             if prep.running {
                 ProgressView().controlSize(.small)
@@ -428,8 +478,32 @@ struct LauncherView: View {
             Toggle("Motion controls", isOn: $s.motion)
             Toggle("Spatial audio", isOn: $s.spatial)
             caption("Plays the game's 5.1 mix in spatial audio. Choose Fixed or Head Tracked for AirPods in Control Center")
-            Toggle("iPhone controllers", isOn: $s.phonePads)
-            caption("iPhones on this network join as players with Mush8's \"Use as a controller\"")
+            Toggle("Phone controllers", isOn: $s.phonePads)
+            if s.phonePads {
+                phoneJoin
+            } else {
+                caption("Phones on this network join as players from their browser, nothing to install")
+            }
+        }
+    }
+
+    @ViewBuilder var phoneJoin: some View {
+        if let url = joinURL(sys.nets) {
+            HStack(alignment: .top, spacing: 14) {
+                if let qr = qrCode(url) {
+                    Image(decorative: qr, scale: 1).interpolation(.none).resizable()
+                        .frame(width: 112, height: 112).padding(6).background(.white, in: RoundedRectangle(cornerRadius: 8))
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Scan with a phone's camera, or open")
+                    Text(url).font(.callout.monospaced()).textSelection(.enabled)
+                    caption("Each phone on this Wi-Fi joins as the next player once the game runs. iPhones with Mush8 can also use \"Use as a controller\"")
+                    if let problem = sys.firewall { Text(problem).font(.caption).foregroundStyle(.orange) }
+                }
+            }
+            .padding(.vertical, 4)
+        } else {
+            caption("Connect this Mac to Wi-Fi or Ethernet so phones can join")
         }
     }
 

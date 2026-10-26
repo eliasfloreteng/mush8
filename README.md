@@ -21,11 +21,11 @@ Mush8 will then asks for them : on macOS pick the folder holding them in the lau
 
 ## Requirements
 - Apple Silicon Mac, macOS 14 or later
-- Rust toolchain
+- Rust toolchain, with the Wasm target for the phone controller page (`rustup target add wasm32-unknown-unknown`)
 - Xcode 26 or later
 
 For iOS, also :
-- `rustup` with `rustup toolchain install 1.98.1` and `rustup target add aarch64-apple-ios --toolchain 1.98.1`
+- `rustup` with `rustup toolchain install 1.98.1` and `rustup target add aarch64-apple-ios wasm32-unknown-unknown --toolchain 1.98.1`
 - `xcodegen` (`brew install xcodegen`)
 - an Apple ID to sign the app on iOS (a free one works), or AltStore / SideStore to install the `.ipa`
 - a device on iOS/macOS 26 or later, with 6 GB of RAM or more (8 GB is comfy)
@@ -63,6 +63,8 @@ Pick a mode in the launcher, under Multiplayer :
 
 In the game, the main menu then shows LAN Play, Online Play or Wireless Play
 
+For split screen on one Mac or iPad, phones can join as extra players from their browser by scanning the launcher's QR code, see Controls
+
 ## Controls
 Any controller works (Switch Pro, Joy-Con, DualSense, Xbox...), each one is a player. On macOS the keyboard works too (WASD stick, arrows d-pad, X/Return A, Z/Backspace B, Q/E L/R, 1/3 ZL/ZR, Tab +), on iOS there are touch controls when no controller is connected
 
@@ -70,7 +72,11 @@ The touchscreen works too : tap the game on iOS, click it on macOS
 
 Motion controls (gyro steering) are off by default, turn them on in the launcher
 
-An iPhone can be a controller too : open Mush8 on it and tap "Use as a controller for a Mac" (no game files needed). It finds the Mac running Mush8 on the same Wi-Fi and joins as the next player with its touch controls (and its motion, if Motion controls is on in the Mac launcher). Turn "iPhone controllers" on in the Mac launcher (it is by default), or on an iPad playing the game
+Any phone can be a controller too, iPhone or Android, with nothing installed : turn "Phone controllers" on in the launcher (it is by default on macOS, on an iPad playing the game turn it on yourself), then scan the QR code it shows with the phone's camera, or open the address under it (like `http://192.168.1.20:21421`) in the phone's browser while the game runs. Each phone on the same Wi-Fi joins as the next player with touch controls: a stick, A/B/X/Y, L/R and +/−. Turn the phone sideways to play. It reconnects by itself after the screen locks or Wi-Fi drops, and an Android phone vibrates when the game rumbles. The in-game controller screen shows the address too. Browser controllers are touch only for now: browsers give motion data only to HTTPS pages
+
+An iPhone with Mush8 installed can also open it and tap "Use as a controller for a Mac" (no game files needed). It finds the Mac or iPad running Mush8 on the same Wi-Fi and joins the same way, with its motion too if Motion controls is on in the launcher
+
+If phones can't connect on macOS, check the firewall lets Mush8 accept incoming connections (System Settings → Network → Firewall → Options): the launcher warns you when it doesn't
 
 ## Limitations
 - free Apple IDs and the `.ipa` (AltStore / SideStore) don't get the extended virtual addressing entitlement, so the game runs with a smaller 5 GB memory layout there (a paid account gets the full one)

@@ -3,22 +3,7 @@
 use crate::services::hid::PadState;
 use objc2_game_controller::*;
 
-pub const A: u64 = 1 << 0;
-pub const B: u64 = 1 << 1;
-pub const X: u64 = 1 << 2;
-pub const Y: u64 = 1 << 3;
-pub const STICK_L: u64 = 1 << 4;
-pub const STICK_R: u64 = 1 << 5;
-pub const L: u64 = 1 << 6;
-pub const R: u64 = 1 << 7;
-pub const ZL: u64 = 1 << 8;
-pub const ZR: u64 = 1 << 9;
-pub const PLUS: u64 = 1 << 10;
-pub const MINUS: u64 = 1 << 11;
-pub const LEFT: u64 = 1 << 12;
-pub const UP: u64 = 1 << 13;
-pub const RIGHT: u64 = 1 << 14;
-pub const DOWN: u64 = 1 << 15;
+pub use nxpad::{A, B, DOWN, L, LEFT, MINUS, Motion, PLUS, R, RIGHT, STICK_L, STICK_R, UP, X, Y, ZL, ZR};
 const STICK_DIRS: u32 = 16;
 
 const STICK_MAX: f32 = 32767.0;
@@ -40,12 +25,6 @@ fn scripted(player: usize) -> u64 {
 }
 
 pub const MAX_PLAYERS: usize = 8;
-
-#[derive(Clone, Copy)]
-pub struct Motion {
-    pub accel: [f32; 3],
-    pub gyro: [f32; 3],
-}
 
 pub static MOTION: std::sync::Mutex<[Option<Motion>; MAX_PLAYERS]> = std::sync::Mutex::new([None; MAX_PLAYERS]);
 
@@ -142,7 +121,7 @@ pub static FILL_TO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 
 pub struct Pads {
     slots: [Option<objc2::rc::Retained<GCController>>; MAX_PLAYERS],
-    phones: [Option<std::net::SocketAddr>; MAX_PLAYERS],
+    phones: [Option<crate::remote::Link>; MAX_PLAYERS],
     extra: usize,
     fill: usize,
     touch_init: bool,
@@ -177,8 +156,10 @@ impl Pads {
             }
             let phones = crate::remote::connected();
             for (i, s) in self.phones.iter_mut().enumerate() {
-                if s.is_some_and(|a| !phones.iter().any(|(p, _)| *p == a)) {
-                    eprintln!("[input] iPhone controller left player {}", i + 1);
+                if let Some(link) = *s
+                    && !phones.iter().any(|(p, _)| *p == link)
+                {
+                    eprintln!("[input] {} controller left player {}", link.name(), i + 1);
                     *s = None;
                     changed = true;
                 }
@@ -202,17 +183,17 @@ impl Pads {
                     changed = true;
                 }
             }
-            for &(addr, _) in &phones {
-                if self.phones.contains(&Some(addr)) {
+            for &(link, _) in &phones {
+                if self.phones.contains(&Some(link)) {
                     continue;
                 }
                 let Some(i) = free(&self.slots, &self.phones) else {
-                    crate::remote::set_player(addr, 0);
+                    crate::remote::set_player(link, 0);
                     continue;
                 };
-                eprintln!("[input] iPhone controller is player {}", i + 1);
-                self.phones[i] = Some(addr);
-                crate::remote::set_player(addr, i as u8 + 1);
+                eprintln!("[input] {} controller is player {}", link.name(), i + 1);
+                self.phones[i] = Some(link);
+                crate::remote::set_player(link, i as u8 + 1);
                 changed = true;
             }
             if changed {
@@ -263,7 +244,7 @@ impl Pads {
                 }
                 let name = match slot {
                     Some(c) => Some(c.vendorName().map_or("Controller".into(), |n| n.to_string())),
-                    None if remote.is_some() => Some("iPhone".into()),
+                    None if remote.is_some() => self.phones[i].map(|l| l.name().into()),
                     None if i == 0 && cfg!(target_os = "ios") => Some("Touch controls".into()),
                     None if i == 0 => Some("Keyboard".into()),
                     None if virtual_pad => Some("Virtual controller".into()),
@@ -355,7 +336,7 @@ impl Acc {
         }
     }
 
-    fn remote(&mut self, pad: &crate::remote::Pad) {
+    fn remote(&mut self, pad: &nxpad::Pad) {
         self.buttons |= pad.buttons;
         self.lx += pad.sticks[0];
         self.ly += pad.sticks[1];

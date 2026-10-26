@@ -237,10 +237,14 @@ pub fn controller_screen(min: usize, max: usize) -> Option<usize> {
         std::thread::sleep(std::time::Duration::from_millis(30));
         let names = crate::input::SLOT_NAMES.lock().unwrap().clone();
         let n = connected();
+        let first_free = names[..max].iter().position(Option::is_none);
+        let phones = first_free.and_then(|_| crate::remote::join_url());
         let rows: Vec<String> = (0..max)
-            .map(|i| match &names[i] {
-                Some(name) => format!("Player {}  ·  {name}", i + 1),
-                None => format!("Player {}  ·  connect a controller", i + 1),
+            .map(|i| match (&names[i], phones.as_ref().filter(|_| Some(i) == first_free)) {
+                (Some(name), _) => format!("Player {}  ·  {name}", i + 1),
+                (None, Some(Ok(url))) => format!("Player {}  ·  or open {} on a phone", i + 1, url.trim_start_matches("http://")),
+                (None, Some(Err(why))) => format!("Player {}  ·  phones can't join: {why}", i + 1),
+                (None, None) => format!("Player {}  ·  connect a controller", i + 1),
             })
             .collect();
         let keyboard = names[0].as_deref() == Some("Keyboard");

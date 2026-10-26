@@ -67,6 +67,14 @@ pub fn last(player: usize, side: usize) -> Value {
     SHARED.lock().unwrap().values[player][side]
 }
 
+/// How hard a player should feel the rumble right now, 0 to 1, for phones whose motor can only go on and off
+pub fn strength(player: usize) -> f32 {
+    if !enabled() {
+        return 0.0;
+    }
+    SHARED.lock().unwrap().values.get(player).map_or(0.0, |v| v[0].feel().0.max(v[1].feel().0))
+}
+
 pub fn set_controllers(slots: &[Option<Retained<GCController>>; MAX_PLAYERS]) {
     let mut s = SHARED.lock().unwrap();
     s.controllers = std::array::from_fn(|i| slots[i].clone().map(Ctl));

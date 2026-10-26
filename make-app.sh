@@ -32,7 +32,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
   <key>GCSupportsGameMode</key><true/>
   <key>LSSupportsGameMode</key><true/>
-  <key>NSLocalNetworkUsageDescription</key><string>Mush8 finds other players, and iPhones used as controllers, on your local network.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Mush8 finds other players, and phones used as controllers, on your local network.</string>
   <key>NSBonjourServices</key>
   <array><string>_mush8._tcp</string><string>_mush8-mp._udp</string><string>_mush8-pad._udp</string></array>
   <key>NSHighResolutionCapable</key><true/>

@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0b0b0d">
+<title>Mush8 controller</title>
+<style>
+  :root { --ring: rgba(255, 255, 255, 0.8); --fill: rgba(255, 255, 255, 0.08); --pressed: rgba(255, 255, 255, 0.7); }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; position: fixed; inset: 0;
+    background: radial-gradient(ellipse at 50% 30%, #1d1f26, #0b0b0d 70%); color: #fff;
+    font: 600 16px -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    touch-action: none; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+  }
+  #pad { position: absolute; inset: 0; }
+  .ctl, .stick, .knob { position: absolute; box-sizing: border-box; border: 2px solid var(--ring); pointer-events: none; }
+  .ctl { display: flex; align-items: center; justify-content: center; background: var(--fill); text-shadow: 0 1px 0 rgba(0, 0, 0, 0.8); }
+  .ctl.down { background: var(--pressed); color: #000; text-shadow: none; }
+  .stick { background: rgba(255, 255, 255, 0.05); border-color: rgba(255, 255, 255, 0.6); }
+  .knob { background: rgba(255, 255, 255, 0.6); }
+  #hud { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -60%); text-align: center; pointer-events: none; }
+  #player { font-size: 34px; font-weight: 800; letter-spacing: 0.02em; }
+  #status { margin-top: 6px; font-size: 14px; font-weight: 500; color: rgba(255, 255, 255, 0.65); max-width: 44vw; }
+  #hud.off #player { color: rgba(255, 255, 255, 0.45); }
+  #rotate { display: none; position: absolute; inset: 0; align-items: center; justify-content: center; flex-direction: column; gap: 16px; background: #0b0b0d; text-align: center; padding: 24px; }
+  #rotate svg { width: 64px; height: 64px; }
+  @media (orientation: portrait) { #rotate { display: flex; } }
+</style>
+</head>
+<body>
+<div id="pad"></div>
+<div id="hud" class="off"><div id="player">Mush8</div><div id="status">Loading…</div></div>
+<div id="rotate">
+  <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2" width="10" height="18" rx="2"/><path d="M3 15a9 9 0 0 0 6 6"/><path d="M3 15l-1 3m1-3l3 1"/></svg>
+  <div>Turn your phone sideways to play</div>
+</div>
+<div id="probe" style="position:fixed;visibility:hidden;padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)"></div>
+<script type="module">
+const pad = document.getElementById('pad');
+const hud = document.getElementById('hud');
+const say = (player, status) => {
+  hud.className = player ? '' : 'off';
+  document.getElementById('player').textContent = player || 'Mush8';
+  document.getElementById('status').textContent = status;
+};
+
+let w;
+try {
+  const { instance } = await WebAssembly.instantiate(await (await fetch('pad.wasm')).arrayBuffer(), {});
+  w = instance.exports;
+} catch (e) {
+  say('', `This browser can't run the controller (${e.message})`);
+  throw e;
+}
+const bytes = (ptr, len) => new Uint8Array(w.memory.buffer, ptr, len);
+
+const controls = Array.from({ length: w.controls() }, (_, i) => {
+  const el = document.createElement('div');
+  el.className = 'ctl';
+  el.textContent = new TextDecoder().decode(bytes(w.control_label(i), w.control_label_len(i)));
+  pad.append(el);
+  return { el, bit: w.control_bit(i) };
+});
+const stick = Object.assign(document.createElement('div'), { className: 'stick' });
+const knob = Object.assign(document.createElement('div'), { className: 'knob' });
+pad.append(stick, knob);
+
+const place = (el, x, y, r, half = 0) => {
+  Object.assign(el.style, { left: `${x - r - half}px`, top: `${y - r}px`, width: `${2 * (r + half)}px`, height: `${2 * r}px`, borderRadius: `${r}px` });
+};
+
+function layout() {
+  const probe = getComputedStyle(document.getElementById('probe'));
+  w.resize(innerWidth, innerHeight, parseFloat(probe.paddingLeft) || 0, parseFloat(probe.paddingRight) || 0);
+  controls.forEach(({ el }, i) => {
+    const r = w.control_radius(i);
+    place(el, w.control_x(i), w.control_y(i), r, w.control_half(i));
+    el.style.fontSize = `${Math.min(22, Math.max(12, r * 0.55))}px`;
+  });
+  draw();
+}
+
+let drawing = false;
+function draw() {
+  drawing = false;
+  const held = w.buttons();
+  for (const c of controls) c.el.classList.toggle('down', (held & c.bit) !== 0);
+  place(stick, w.stick_x(), w.stick_y(), w.stick_radius());
+  place(knob, w.knob_x(), w.knob_y(), w.knob_radius());
+}
+const redraw = () => { if (!drawing) { drawing = true; requestAnimationFrame(draw); } };
+
+// The socket sends on every change plus a heartbeat. When it backs up, changes wait for the next heartbeat, which always carries the latest state
+let ws, player = -1, heard = 0, failures = 0, retry;
+const HEARTBEAT = 200, SILENCE = 3000;
+function send(force) {
+  if (ws?.readyState !== WebSocket.OPEN || ws.bufferedAmount > 4 * w.pad_len()) return;
+  const ptr = w.packet(force ? 1 : 0);
+  if (ptr) ws.send(bytes(ptr, w.pad_len()).slice());
+}
+
+let id = sessionStorage.getItem('mush8-pad');
+if (!id) sessionStorage.setItem('mush8-pad', id = crypto.getRandomValues(new Uint32Array(2)).reduce((s, n) => s + n.toString(16).padStart(8, '0'), ''));
+
+function connect() {
+  clearTimeout(retry);
+  if (ws && ws.readyState <= WebSocket.OPEN) return;
+  say('', failures > 2 ? "Can't reach the game. Is Mush8 still running, on this Wi-Fi?" : 'Connecting…');
+  const s = ws = new WebSocket(`ws://${location.host}/ws?id=${id}`);
+  s.binaryType = 'arraybuffer';
+  s.onopen = () => {
+    failures = 0;
+    heard = performance.now();
+    player = -1;
+    w.reset();
+    say('', 'Joining…');
+    send(true);
+  };
+  s.onmessage = (e) => {
+    const data = new Uint8Array(e.data);
+    bytes(w.inbox(), w.inbox_len()).set(data.subarray(0, w.inbox_len()));
+    const p = w.ack(data.length);
+    if (p < 0) return;
+    heard = performance.now();
+    if (p !== player) say(p ? `Player ${p}` : '', p ? 'Connected' : 'The game is full: no free player slot');
+    player = p;
+    rumble(w.rumble());
+  };
+  s.onclose = () => {
+    if (ws !== s) return;
+    rumble(0);
+    failures++;
+    say('', failures > 2 ? "Can't reach the game. Is Mush8 still running, on this Wi-Fi?" : 'Reconnecting…');
+    retry = setTimeout(connect, Math.min(4000, 250 * 2 ** failures));
+  };
+}
+
+setInterval(() => {
+  send(true);
+  if (ws?.readyState === WebSocket.OPEN && performance.now() - heard > SILENCE) ws.close();
+}, HEARTBEAT);
+
+// navigator.vibrate is Android only: a level becomes how much of each 50 ms the motor runs, until the next ack
+let buzzing = false;
+function rumble(level) {
+  if (!navigator.vibrate) return;
+  if (level < 0.05) {
+    if (buzzing) navigator.vibrate(0);
+    buzzing = false;
+    return;
+  }
+  const on = Math.round(8 + 42 * Math.min(1, level));
+  buzzing = navigator.vibrate(Array.from({ length: 24 }, (_, i) => (i % 2 ? 50 - on : on)));
+}
+
+const point = (e) => [e.clientX, e.clientY];
+pad.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  fullscreen();
+  if (w.touch_start(e.pointerId, ...point(e))) { send(false); redraw(); }
+});
+pad.addEventListener('pointermove', (e) => {
+  if (w.touch_move(e.pointerId, ...point(e))) { send(false); redraw(); }
+});
+for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+  pad.addEventListener(type, (e) => { w.touch_end(e.pointerId); send(false); redraw(); });
+}
+for (const type of ['touchstart', 'touchmove', 'gesturestart', 'contextmenu', 'dblclick']) {
+  document.addEventListener(type, (e) => e.preventDefault(), { passive: false });
+}
+
+function letGo() {
+  w.release();
+  send(true);
+  rumble(0);
+  redraw();
+}
+document.addEventListener('visibilitychange', () => (document.hidden ? letGo() : connect()));
+addEventListener('pageshow', connect);
+addEventListener('blur', letGo);
+addEventListener('online', connect);
+
+// Android can go full screen and stay landscape; iPhone Safari can't, Add to Home Screen gets close
+let wentFull = false;
+function fullscreen() {
+  if (wentFull || !document.fullscreenEnabled || matchMedia('(display-mode: standalone)').matches) return;
+  wentFull = true;
+  document.documentElement.requestFullscreen({ navigationUI: 'hide' }).then(() => screen.orientation?.lock?.('landscape')).catch(() => {});
+}
+
+addEventListener('resize', layout);
+screen.orientation?.addEventListener?.('change', layout);
+layout();
+connect();
+</script>
+</body>
+</html>

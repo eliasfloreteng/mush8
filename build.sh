@@ -139,6 +139,7 @@ if ! command -v rustup >/dev/null; then
 fi
 rustup toolchain list | grep '^stable' >/dev/null || rustup toolchain install stable --profile minimal
 rustup default >/dev/null 2>&1 || rustup default stable
+rustup target list --installed | grep '^wasm32-unknown-unknown$' >/dev/null || rustup target add wasm32-unknown-unknown
 cargo --version
 
 if [ "$PLATFORM" = 1 ]; then
@@ -161,6 +162,7 @@ xcodebuild -downloadComponent MetalToolchain
 bold "Preparing the iOS toolchain"
 rustup toolchain list | grep "^$TOOLCHAIN" >/dev/null || rustup toolchain install "$TOOLCHAIN" --profile minimal
 rustup target list --toolchain "$TOOLCHAIN" --installed | grep '^aarch64-apple-ios$' >/dev/null || rustup target add aarch64-apple-ios --toolchain "$TOOLCHAIN"
+rustup target list --toolchain "$TOOLCHAIN" --installed | grep '^wasm32-unknown-unknown$' >/dev/null || rustup target add wasm32-unknown-unknown --toolchain "$TOOLCHAIN"
 if ! xcodebuild -showsdks 2>/dev/null | grep iphoneos >/dev/null; then
   echo "Downloading the iOS platform for Xcode (a few GB):"
   xcodebuild -downloadPlatform iOS

@@ -10,6 +10,7 @@ const FIRST_SEGMENT: u64 = 0x1_0400_0000;
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(embedded_modules)");
     println!("cargo:rerun-if-env-changed=NX_MODULES_DIR");
+    build_web_controller();
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("ios") {
         return;
     }
@@ -59,6 +60,27 @@ fn main() {
     let out = Path::new(&std::env::var("OUT_DIR").unwrap()).join("modules.s");
     std::fs::write(&out, asm).unwrap();
     println!("cargo:rustc-cfg=embedded_modules");
+}
+
+// The web controller page runs nxwebpad as Wasm. It gets its own target dir so this nested cargo never waits on the outer one's lock
+fn build_web_controller() {
+    for path in ["../nxpad/src", "../nxpad/Cargo.toml", "../nxwebpad/src", "../nxwebpad/Cargo.toml"] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    let root = Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../..");
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR").map_or(root.join("target"), PathBuf::from).join("web");
+    let status = std::process::Command::new(std::env::var("CARGO").unwrap())
+        .args(["build", "--quiet", "-p", "nxwebpad", "--target", "wasm32-unknown-unknown", "--profile", "web", "--target-dir"])
+        .arg(&target_dir)
+        .current_dir(&root)
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_BUILD_TARGET")
+        .status()
+        .expect("cargo");
+    assert!(status.success(), "building the web controller failed: it needs the Wasm target (rustup target add wasm32-unknown-unknown)");
+    let wasm = target_dir.join("wasm32-unknown-unknown/web/nxwebpad.wasm");
+    std::fs::copy(&wasm, Path::new(&std::env::var("OUT_DIR").unwrap()).join("nxwebpad.wasm")).unwrap_or_else(|e| panic!("{}: {e}", wasm.display()));
 }
 
 fn build_launcher() {

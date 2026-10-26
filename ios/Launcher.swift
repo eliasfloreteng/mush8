@@ -1,6 +1,7 @@
 // Mush8 - Launcher.swift
 // Constantin Clerc (c22dev) - 0.1
 import Combine
+import CoreImage
 import Network
 import SwiftUI
 import UIKit
@@ -107,6 +108,35 @@ final class LocalNetwork: ObservableObject {
         browser?.cancel()
         browser = nil
     }
+}
+
+let padPort = 21421
+
+// The address phones type to reach the game: Wi-Fi or Ethernet, never a VPN or link-local one (.local names don't resolve on every phone)
+func joinURL() -> String? {
+    var found: [(name: String, ip: String)] = []
+    var ifs: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&ifs) == 0, let first = ifs else { return nil }
+    defer { freeifaddrs(ifs) }
+    for p in sequence(first: first, next: { $0.pointee.ifa_next }) {
+        let flags = Int32(p.pointee.ifa_flags)
+        guard let a = p.pointee.ifa_addr, a.pointee.sa_family == UInt8(AF_INET), flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0 else { continue }
+        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        if getnameinfo(a, socklen_t(a.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+            found.append((String(cString: p.pointee.ifa_name), String(cString: host)))
+        }
+    }
+    let usable = found.filter { n in !["utun", "bridge", "awdl", "llw", "anpi", "ap", "pdp_ip"].contains { n.name.hasPrefix($0) } && !n.ip.hasPrefix("169.254.") }
+    let pick = usable.first { $0.name == "en0" } ?? usable.first { $0.name.hasPrefix("en") }
+    return pick.map { "http://\($0.ip):\(padPort)" }
+}
+
+func qrCode(_ text: String) -> CGImage? {
+    guard let f = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+    f.setValue(Data(text.utf8), forKey: "inputMessage")
+    f.setValue("M", forKey: "inputCorrectionLevel")
+    guard let out = f.outputImage?.transformed(by: CGAffineTransform(scaleX: 8, y: 8)) else { return nil }
+    return CIContext().createCGImage(out, from: out.extent)
 }
 
 struct GameFile: Identifiable {
@@ -222,6 +252,7 @@ struct LauncherView: View {
     @State private var error: String?
     @State private var picking = false
     @State private var memory = os_proc_available_memory()
+    @State private var join = joinURL()
     @Environment(\.scenePhase) private var phase
     let play: () -> Void
     let controller: () -> Void
@@ -284,9 +315,22 @@ struct LauncherView: View {
                     Text("Plays the game's 5.1 mix in spatial audio. Choose Fixed or Head Tracked for AirPods in Control Center")
                 }
                 Section {
-                    Toggle("iPhone controllers", isOn: $s.phonePads)
+                    Toggle("Phone controllers", isOn: $s.phonePads)
+                    if s.phonePads, let join, let qr = qrCode(join) {
+                        HStack(spacing: 16) {
+                            Image(decorative: qr, scale: 1).interpolation(.none).resizable()
+                                .frame(width: 112, height: 112).padding(6).background(.white, in: RoundedRectangle(cornerRadius: 8))
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Scan with a phone's camera, or open")
+                                Text(join).font(.callout.monospaced()).textSelection(.enabled)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    } else if s.phonePads {
+                        Text("Join a Wi-Fi network so phones can reach this device").font(.caption).foregroundStyle(.orange)
+                    }
                 } footer: {
-                    Text("Nearby iPhones can join as players with \"Use as a controller\"")
+                    Text("Phones on this Wi-Fi join as players from their browser, nothing to install. iPhones with Mush8 can also use \"Use as a controller\"")
                 }
                 Section {
                     Picker("Console mode", selection: $s.handheld) {
@@ -352,6 +396,7 @@ struct LauncherView: View {
         .task {
             while !Task.isCancelled {
                 memory = os_proc_available_memory()
+                join = joinURL()
                 try? await Task.sleep(for: .seconds(2))
             }
         }

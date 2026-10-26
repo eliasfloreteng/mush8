@@ -1,62 +1,129 @@
 // Mush8 - remote.rs
 // Constantin Clerc (c22dev) - 0.1
-use crate::input::Motion;
+use nxpad::{Ack, Pad};
+use std::collections::HashMap;
+use std::fmt;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+mod web;
+
+pub use web::join_url;
 
 const TYPE: &str = "_mush8-pad._udp";
 const PORT: u16 = 21421;
-const PAD: [u8; 4] = *b"M8P1";
-const ACK: [u8; 4] = *b"M8A1";
-const LEN: usize = 4 + 8 + 16 + 1 + 24;
 const TIMEOUT: Duration = Duration::from_secs(3);
+const ACK_EVERY: Duration = Duration::from_millis(500);
 
-#[derive(Clone, Copy, Default)]
-pub struct Pad {
-    pub buttons: u64,
-    pub sticks: [f32; 4],
-    pub motion: Option<Motion>,
+/// How a phone reaches the game: the Mush8 app over UDP, or a browser over a WebSocket (keyed by the id the page keeps across reconnects)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Link {
+    App(SocketAddr),
+    Web(u64),
 }
 
-impl Pad {
-    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
-    fn encode(&self) -> [u8; LEN] {
-        let mut b = [0u8; LEN];
-        b[..4].copy_from_slice(&PAD);
-        b[4..12].copy_from_slice(&self.buttons.to_le_bytes());
-        let m = self.motion.unwrap_or(Motion { accel: [0.0; 3], gyro: [0.0; 3] });
-        for (i, f) in self.sticks.iter().chain(&m.accel).chain(&m.gyro).enumerate() {
-            let o = if i < 4 { 12 + 4 * i } else { 29 + 4 * (i - 4) };
-            b[o..o + 4].copy_from_slice(&f.to_le_bytes());
+impl Link {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Link::App(_) => "iPhone",
+            Link::Web(_) => "Phone",
         }
-        b[28] = self.motion.is_some() as u8;
-        b
     }
+}
 
-    fn decode(b: &[u8]) -> Option<Pad> {
-        if b.len() < LEN || b[..4] != PAD {
-            return None;
+impl fmt::Display for Link {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Link::App(addr) => write!(f, "iPhone controller at {addr}"),
+            Link::Web(id) => write!(f, "browser controller {id:016x}"),
         }
-        let f = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap()).clamp(-64.0, 64.0);
-        let v = |o: usize| [f(o), f(o + 4), f(o + 8)];
-        Some(Pad {
-            buttons: u64::from_le_bytes(b[4..12].try_into().unwrap()),
-            sticks: [f(12), f(16), f(20), f(24)].map(|x| x.clamp(-1.0, 1.0)),
-            motion: (b[28] != 0).then(|| Motion { accel: v(29), gyro: v(41) }),
-        })
     }
 }
 
 struct Phone {
-    addr: SocketAddr,
+    link: Link,
     pad: Pad,
     seen: Instant,
     player: Option<u8>,
-    acked: Option<(Instant, u8)>,
 }
 
-static PHONES: Mutex<Vec<Phone>> = Mutex::new(Vec::new());
+/// Every connected phone, whatever its transport. Input gives each one a player slot, the transports ack it back
+struct Registry(Vec<Phone>);
+
+impl Registry {
+    fn sweep(&mut self, now: Instant) {
+        self.0.retain(|p| {
+            let live = now.duration_since(p.seen) < TIMEOUT;
+            if !live {
+                eprintln!("[phone] {} disconnected", p.link);
+            }
+            live
+        });
+    }
+
+    fn feed(&mut self, link: Link, pad: Pad, now: Instant) {
+        match self.0.iter_mut().find(|p| p.link == link) {
+            Some(p) => (p.pad, p.seen) = (pad, now),
+            None => {
+                eprintln!("[phone] {link} connected");
+                self.0.push(Phone { link, pad, seen: now, player: None });
+            }
+        }
+    }
+
+    fn player(&self, link: Link) -> Option<u8> {
+        self.0.iter().find(|p| p.link == link)?.player
+    }
+
+    fn set_player(&mut self, link: Link, player: u8) {
+        if let Some(p) = self.0.iter_mut().find(|p| p.link == link) {
+            p.player = Some(player);
+        }
+    }
+}
+
+static PHONES: Mutex<Registry> = Mutex::new(Registry(Vec::new()));
+
+fn phones() -> MutexGuard<'static, Registry> {
+    let mut phones = PHONES.lock().unwrap();
+    phones.sweep(Instant::now());
+    phones
+}
+
+/// Takes a pad from any transport: a new link joins, a known one is refreshed
+pub fn feed(link: Link, pad: Pad) {
+    phones().feed(link, pad, Instant::now());
+}
+
+/// What to tell a phone once input has given it a slot (player 0 when the game is full)
+pub fn ack(link: Link) -> Option<Ack> {
+    let player = phones().player(link)?;
+    let rumble = if player == 0 { 0.0 } else { crate::haptics::strength(player as usize - 1) };
+    Some(Ack { player, rumble: (rumble.clamp(0.0, 1.0) * 15.0).round() as u8 * 17 })
+}
+
+pub fn connected() -> Vec<(Link, Pad)> {
+    phones().0.iter().map(|p| (p.link, p.pad)).collect()
+}
+
+pub fn set_player(link: Link, player: u8) {
+    phones().set_player(link, player);
+}
+
+/// Sends an ack when it changes, and every ACK_EVERY so the phone knows the game is still there
+#[derive(Default)]
+struct Pacer(Option<(Instant, Ack)>);
+
+impl Pacer {
+    fn due(&mut self, now: Instant, ack: Ack) -> bool {
+        let due = self.0.is_none_or(|(at, was)| was != ack || now.duration_since(at) >= ACK_EVERY);
+        if due {
+            self.0 = Some((now, ack));
+        }
+        due
+    }
+}
 
 pub fn enabled() -> bool {
     let default = cfg!(target_os = "macos");
@@ -64,6 +131,7 @@ pub fn enabled() -> bool {
 }
 
 pub fn host() {
+    web::serve();
     let sock = match UdpSocket::bind(("0.0.0.0", PORT)) {
         Ok(s) => s,
         Err(e) => {
@@ -74,36 +142,21 @@ pub fn host() {
     let _ = sock.set_read_timeout(Some(Duration::from_millis(250)));
     let _ = std::thread::Builder::new().name("phone-pads".into()).spawn(move || {
         let mut buf = [0u8; 256];
+        let mut pacers: HashMap<SocketAddr, Pacer> = HashMap::new();
         loop {
-            let got = sock.recv_from(&mut buf);
-            let now = Instant::now();
-            let mut phones = PHONES.lock().unwrap();
-            if let Ok((n, addr)) = got {
-                if let Some(pad) = Pad::decode(&buf[..n]) {
-                    match phones.iter_mut().find(|p| p.addr == addr) {
-                        Some(p) => (p.pad, p.seen) = (pad, now),
-                        None => {
-                            eprintln!("[phone] iPhone controller connected from {addr}");
-                            phones.push(Phone { addr, pad, seen: now, player: None, acked: None });
-                        }
-                    }
-                }
+            if let Ok((n, addr)) = sock.recv_from(&mut buf)
+                && let Some(pad) = Pad::decode(&buf[..n])
+            {
+                feed(Link::App(addr), pad);
             }
-            phones.retain(|p| {
-                let live = now.duration_since(p.seen) < TIMEOUT;
-                if !live {
-                    eprintln!("[phone] iPhone controller at {} disconnected", p.addr);
-                }
-                live
-            });
-            for p in phones.iter_mut() {
-                let Some(player) = p.player else { continue };
-                if p.acked.is_none_or(|(at, was)| was != player || now.duration_since(at) > Duration::from_millis(500)) {
-                    let mut ack = [0u8; 5];
-                    ack[..4].copy_from_slice(&ACK);
-                    ack[4] = player;
-                    let _ = sock.send_to(&ack, p.addr);
-                    p.acked = Some((now, player));
+            let now = Instant::now();
+            let apps: Vec<SocketAddr> = phones().0.iter().filter_map(|p| if let Link::App(a) = p.link { Some(a) } else { None }).collect();
+            pacers.retain(|a, _| apps.contains(a));
+            for addr in apps {
+                if let Some(ack) = ack(Link::App(addr))
+                    && pacers.entry(addr).or_default().due(now, ack)
+                {
+                    let _ = sock.send_to(&ack.encode(), addr);
                 }
             }
         }
@@ -127,16 +180,6 @@ fn advertise() {
         eprintln!("[phone] iPhones can join as controllers ({TYPE})");
         while wait(sd, -1) && DNSServiceProcessResult(sd) == 0 {}
         DNSServiceRefDeallocate(sd);
-    }
-}
-
-pub fn connected() -> Vec<(SocketAddr, Pad)> {
-    PHONES.lock().unwrap().iter().map(|p| (p.addr, p.pad)).collect()
-}
-
-pub fn set_player(addr: SocketAddr, player: u8) {
-    if let Some(p) = PHONES.lock().unwrap().iter_mut().find(|p| p.addr == addr) {
-        p.player = Some(player);
     }
 }
 
@@ -182,11 +225,11 @@ mod phone {
                 let _ = sock.send_to(&pad.encode(), host.addr);
                 let mut buf = [0u8; 16];
                 while let Ok((n, from)) = sock.recv_from(&mut buf) {
-                    if from == host.addr && n >= 5 && buf[..4] == ACK {
+                    if from == host.addr && let Some(ack) = Ack::decode(&buf[..n]) {
                         heard = Instant::now();
-                        if player != Some(buf[4]) {
-                            player = Some(buf[4]);
-                            status(&match buf[4] {
+                        if player != Some(ack.player) {
+                            player = Some(ack.player);
+                            status(&match ack.player {
                                 0 => format!("Controller mode\n\n{} has no free player slot", host.name),
                                 n => format!("Player {n} on {}", host.name),
                             });
@@ -199,7 +242,7 @@ mod phone {
         }
     }
 
-    const LOOKING: &str = "Looking for a Mac running Mush8 on this Wi-Fi…\n(start the game on the Mac, with iPhone controllers on)";
+    const LOOKING: &str = "Looking for a Mac running Mush8 on this Wi-Fi…\n(start the game on the Mac, with phone controllers on)";
     const DENIED: &str = "Local network access is off for Mush8\n\nTurn it on in Settings → Privacy & Security → Local Network";
 
     #[derive(Default)]
@@ -258,14 +301,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pad_roundtrip() {
-        let p = Pad { buttons: 0x8421, sticks: [0.5, -1.0, 0.25, 0.0], motion: Some(Motion { accel: [0.1, -0.98, 0.2], gyro: [1.5, -2.0, 0.3] }) };
-        let q = Pad::decode(&p.encode()).unwrap();
-        assert_eq!(q.buttons, p.buttons);
-        assert_eq!(q.sticks, p.sticks);
-        let (m, n) = (p.motion.unwrap(), q.motion.unwrap());
-        assert_eq!((m.accel, m.gyro), (n.accel, n.gyro));
-        assert!(Pad::decode(&Pad { motion: None, ..p }.encode()).unwrap().motion.is_none());
-        assert!(Pad::decode(b"nope").is_none());
+    fn registry_tracks_every_transport() {
+        let mut r = Registry(Vec::new());
+        let t = Instant::now();
+        let (app, web) = (Link::App("192.168.1.20:5000".parse().unwrap()), Link::Web(7));
+        let pad = Pad { buttons: nxpad::A, ..Default::default() };
+        r.feed(app, Pad::default(), t);
+        r.feed(web, pad, t);
+        assert_eq!(r.0.len(), 2);
+        assert_eq!(r.player(web), None, "no slot until input gives one");
+        r.set_player(web, 2);
+        r.set_player(app, 0);
+        assert_eq!((r.player(web), r.player(app)), (Some(2), Some(0)));
+        r.feed(web, Pad::default(), t + Duration::from_secs(2));
+        assert_eq!(r.0.len(), 2, "a refresh doesn't add a phone");
+        assert_eq!(r.player(web), Some(2), "and keeps its slot");
+        r.sweep(t + TIMEOUT);
+        assert_eq!(r.0.iter().map(|p| p.link).collect::<Vec<_>>(), [web], "silent phones time out");
+        r.sweep(t + Duration::from_secs(2) + TIMEOUT);
+        assert!(r.0.is_empty());
+    }
+
+    #[test]
+    fn acks_go_out_on_change_and_every_half_second() {
+        let mut p = Pacer::default();
+        let t = Instant::now();
+        let ack = Ack { player: 1, rumble: 0 };
+        assert!(p.due(t, ack));
+        assert!(!p.due(t + Duration::from_millis(100), ack));
+        assert!(p.due(t + Duration::from_millis(120), Ack { rumble: 34, ..ack }));
+        assert!(!p.due(t + Duration::from_millis(200), Ack { rumble: 34, ..ack }));
+        assert!(p.due(t + Duration::from_millis(620), Ack { rumble: 34, ..ack }));
     }
 }
